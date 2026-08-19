@@ -1,0 +1,6 @@
+chromadb
+ollama
+pypdf
+python-docx
+odfpy
+flask
