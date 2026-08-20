@@ -204,15 +204,25 @@ def remove_old_chunks(collection, doc_id: str):
 def determine_ingest_targets(files, root: Path, source_tag: str, collection):
     """Filtra a lista de arquivos, mantendo só os que precisam ser (re)indexados.
     Isso é só metadado no Chroma + hash de arquivo, então roda sequencial
-    mesmo (é rápido) — a parte pesada (extração + embedding) é paralelizada
-    depois. Retorna lista de tuplas (path, doc_id, current_hash)."""
+    mesmo (é rápido por arquivo, mas soma tempo com milhares de arquivos) —
+    a parte pesada (extração + embedding) é paralelizada depois.
+    Mostra uma barra própria pra essa fase, marcando cada arquivo já
+    indexado como "concluído" instantaneamente, pra não parecer que nada
+    está acontecendo enquanto os milhares de arquivos são conferidos.
+    Retorna lista de tuplas (path, doc_id, current_hash)."""
     targets = []
-    for path in files:
+    already = 0
+    novos = 0
+
+    check_bar = tqdm(files, desc="Conferindo já indexados", unit="arquivo", dynamic_ncols=True)
+    for path in check_bar:
         doc_id = f"{source_tag}::{path.relative_to(root)}"
         suffix = path.suffix.lower()
 
         if suffix in IMMUTABLE_EXT:
             if already_indexed_by_id(collection, doc_id):
+                already += 1
+                check_bar.set_postfix(já_indexados=already, novos=novos)
                 continue
             targets.append((path, doc_id, None))
         else:
@@ -222,9 +232,17 @@ def determine_ingest_targets(files, root: Path, source_tag: str, collection):
                 print(f"  [pulado — não foi possível ler] {path.relative_to(root)}: {e}")
                 continue
             if already_indexed(collection, doc_id, current_hash):
+                already += 1
+                check_bar.set_postfix(já_indexados=already, novos=novos)
                 continue
             targets.append((path, doc_id, current_hash))
-    return targets
+
+        novos += 1
+        check_bar.set_postfix(já_indexados=already, novos=novos)
+
+    check_bar.close()
+    print(f"Checagem concluída: {already} já indexado(s) (pulados), {novos} novo(s)/alterado(s) a processar.")
+    return targets, already
 
 
 class PositionPool:
@@ -232,9 +250,9 @@ class PositionPool:
     estão sendo indexados ao mesmo tempo, pra cada um ter sua barra fixa
     numa linha só (em vez de ficarem se sobrepondo/pulando)."""
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, start: int = 1):
         self._lock = threading.Lock()
-        self._free = list(range(1, size + 1))  # posição 0 é a barra geral
+        self._free = list(range(start, start + size))  # posições abaixo de `start` são reservadas pras barras fixas
 
     def acquire(self):
         with self._lock:
@@ -324,13 +342,19 @@ def embed_chunks_parallel(path: Path, chunks, embed_executor: ThreadPoolExecutor
 
 
 def process_one_file(path, doc_id, current_hash, text, source_tag, collection,
-                      embed_pool, position_pool, root, write_lock, counters, counters_lock, overall_bar):
+                      embed_pool, position_pool, root, write_lock, counters, counters_lock,
+                      session_bar, biblioteca_bar):
     """Faz o chunk + embedding + gravação de UM arquivo. Roda dentro do
-    file_pool, então vários arquivos passam por aqui ao mesmo tempo."""
+    file_pool, então vários arquivos passam por aqui ao mesmo tempo.
+
+    session_bar: progresso desta sessão (só os arquivos novos/alterados, 0->100%).
+    biblioteca_bar: progresso da Biblioteca inteira (já parte de "já_indexados"
+    pré-preenchido, e só avança quando um arquivo é indexado com SUCESSO —
+    arquivos pulados por erro não contam como "completos")."""
     chunks = chunk_text(text)
     if not chunks:
         with counters_lock:
-            overall_bar.update(1)
+            session_bar.update(1)
         return
 
     pos = position_pool.acquire()
@@ -343,7 +367,7 @@ def process_one_file(path, doc_id, current_hash, text, source_tag, collection,
     if embeddings is None:
         with counters_lock:
             counters["skipped"] += 1
-            overall_bar.update(1)
+            session_bar.update(1)
         return
 
     ids = [f"{doc_id}::{i}" for i in range(len(chunks))]
@@ -363,7 +387,8 @@ def process_one_file(path, doc_id, current_hash, text, source_tag, collection,
 
     with counters_lock:
         counters["updated"] += 1
-        overall_bar.update(1)
+        session_bar.update(1)
+        biblioteca_bar.update(1)  # só avança na barra geral quando realmente indexado
 
 
 def scan_and_ingest(root: Path, source_tag: str,
@@ -380,7 +405,7 @@ def scan_and_ingest(root: Path, source_tag: str,
         return
 
     print(f"[{source_tag}] Encontrados {len(files)} arquivos. Verificando mudanças...")
-    targets = determine_ingest_targets(files, root, source_tag, collection)
+    targets, already = determine_ingest_targets(files, root, source_tag, collection)
 
     if not targets:
         print(f"Nada novo para indexar [{source_tag}]. Total de chunks na coleção: {collection.count()}")
@@ -399,10 +424,15 @@ def scan_and_ingest(root: Path, source_tag: str,
     counters = {"updated": 0, "skipped": 0}
     counters_lock = threading.Lock()
     write_lock = threading.Lock()
-    position_pool = PositionPool(n_files)
+    position_pool = PositionPool(n_files, start=2)  # posições 0 e 1 são as duas barras fixas
 
-    overall_bar = tqdm(total=len(targets), desc="Progresso geral", unit="arquivo",
-                        position=0, leave=True, dynamic_ncols=True)
+    # Barra 0: Biblioteca inteira — já nasce preenchida com o que estava indexado antes.
+    # Só avança quando um arquivo é indexado com SUCESSO (não conta pulados como "completo").
+    biblioteca_bar = tqdm(total=len(files), initial=already, desc="Biblioteca completa", unit="arquivo",
+                           position=0, leave=True, dynamic_ncols=True)
+    # Barra 1: progresso desta sessão — só os arquivos novos/alterados, sempre 0% -> 100%.
+    session_bar = tqdm(total=len(targets), desc="Progresso da sessão", unit="arquivo",
+                        position=1, leave=True, dynamic_ncols=True)
 
     # Dispara a extração de TODOS os arquivos de uma vez no pool de processos.
     future_to_target = {
@@ -420,13 +450,13 @@ def scan_and_ingest(root: Path, source_tag: str,
             log_skipped(path, f"extração de texto travou (>{EXTRACTION_TIMEOUT_SECONDS}s) — provável arquivo corrompido")
             with counters_lock:
                 counters["skipped"] += 1
-                overall_bar.update(1)
+                session_bar.update(1)  # só a sessão avança; biblioteca_bar não, pois não foi indexado de fato
             continue
         except Exception as e:
             log_skipped(path, f"erro inesperado na extração — {e}")
             with counters_lock:
                 counters["skipped"] += 1
-                overall_bar.update(1)
+                session_bar.update(1)
             continue
 
         # Cada arquivo pronto (texto extraído) vai pro pool de indexação —
@@ -434,14 +464,16 @@ def scan_and_ingest(root: Path, source_tag: str,
         # ao mesmo tempo, cada um com sua barra própria.
         task = file_pool.submit(
             process_one_file, path, doc_id, current_hash, text, source_tag, collection,
-            embed_pool, position_pool, root, write_lock, counters, counters_lock, overall_bar,
+            embed_pool, position_pool, root, write_lock, counters, counters_lock,
+            session_bar, biblioteca_bar,
         )
         file_tasks.append(task)
 
     for task in file_tasks:
         task.result()  # espera terminar e propaga qualquer exceção inesperada
 
-    overall_bar.close()
+    session_bar.close()
+    biblioteca_bar.close()
 
     print(f"Concluído. {counters['updated']} arquivo(s) atualizado(s)/adicionado(s), "
           f"{counters['skipped']} pulado(s) por erro [{source_tag}].")
